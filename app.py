@@ -8,6 +8,7 @@ import matplotlib
 matplotlib.use("Agg")
 from matplotlib.figure import Figure
 import streamlit as st
+from datetime import date
 
 import pension_core as pc
 import salary_engine as se
@@ -36,14 +37,40 @@ def sidebar_inputs():
     sf = sb.number_input("sf — buy-out salary (€/mo)", value=1000.0, step=50.0)
     N = sb.slider("N — πλασματικά έτη (bought)", 0, pc.MAX_N, 5)
     L = sb.slider("L — life expectancy beyond D (yrs)", 0, 25, 20)
-    A = sb.number_input("A — επικουρική (€/mo)", value=300.0, step=50.0)
-    i = sb.number_input("i — inflation / discount", value=0.02, step=0.005, format="%.3f")
+    i = sb.number_input("i — inflation / discount (%)", value=2.0, step=0.25,
+                        format="%.2f") / 100.0
     dsf = sb.number_input("Δsf — step for sf-curve family (€)", value=200.0, step=50.0)
 
+    sb.subheader("Επικουρική (A)")
+    compute_epik = sb.checkbox("Compute A (Τμήμα Α + Β)  —  else manual", value=False)
+    A = ep = None
+    if compute_epik:
+        auto_rante = sb.checkbox("Auto ράντα from official table (by age)", value=True)
+        ep = dict(
+            epik_start=sb.text_input("επικ. insurance start (d/m/y)", "1/9/1997"),
+            s_ep=sb.number_input("⟨s_ep⟩ — επικ. earnings base (€/mo)", value=float(s), step=50.0),
+            accrual_A=sb.number_input("Τμήμα Α accrual (%)", value=0.45,
+                                      step=0.05, format="%.2f") / 100.0,
+            c_rate_B=sb.number_input("Τμήμα Β contribution rate (%)", value=6.0,
+                                     step=0.5, format="%.2f") / 100.0,
+            notional_yield=sb.number_input("Τμήμα Β notional yield (%)", value=0.0,
+                                           step=0.5, format="%.2f") / 100.0,
+            annuity_div=(None if auto_rante else
+                         sb.number_input("manual ράντα divisor", value=19.827, step=0.1)),
+            penalty_A=sb.checkbox("early-retirement penalty on Τμήμα Α (1/200·mo, ≤5y)",
+                                  value=True),
+            epik_exagora=sb.checkbox("εξαγορά πλασματικών για επικουρική (+N στο Τμήμα Α)",
+                                     value=False),
+            epik_rate=sb.number_input("επικ. εξαγορά rate (%)", value=6.0,
+                                      step=0.5, format="%.2f") / 100.0,
+        )
+    else:
+        A = sb.number_input("A — επικουρική (€/mo)", value=300.0, step=50.0)
+
     sb.subheader("Abroad")
-    X = sb.number_input("X — total years abroad", value=0.0, step=1.0)
-    EU = sb.number_input("EU — thereof pensionable in EU", value=0.0, step=1.0)
-    NEU = sb.number_input("NEU — thereof pensionable non-EU", value=0.0, step=1.0)
+    X = float(sb.slider("X — total years abroad", 0, 25, 0))
+    EU = float(sb.slider("EU — thereof pensionable in EU", 0, 25, 0))
+    NEU = float(sb.slider("NEU — thereof pensionable non-EU", 0, 25, 0))
     eu_counts = sb.checkbox("EU years count as GR residence", True)
     totalize = sb.checkbox("Apply abroad totalization (EU+NEU → λ, pro-rata)", True)
 
@@ -59,13 +86,14 @@ def sidebar_inputs():
     return dict(T0=T0, D=D, BD=BD, s=s, sf=sf, N=N, L=L, A=A, i=i, dsf=dsf,
                 X=X, EU=EU, NEU=NEU, eu_counts=eu_counts, totalize=totalize,
                 npv_mode=npv_mode, eas_mode=eas_mode, eas_on_epik=eas_on_epik,
-                upfront=0.02 if pay_upfront else 0.0)
+                upfront=0.02 if pay_upfront else 0.0,
+                compute_epik=compute_epik, ep=ep)
 
 
 # ----------------------------------------------------------------------------
 #  Summary (Greek)
 # ----------------------------------------------------------------------------
-def summary_text(v, r, npd, S, B, K):
+def summary_text(v, r, npd, S, B, K, sp=None, k_epik=0.0, m_base=None, A_base=None):
     b, a = r["before"], r["after"]
     sep = "-" * 42
     T0, N, P = v["T0"], v["N"], r["P"]
@@ -86,12 +114,36 @@ def summary_text(v, r, npd, S, B, K):
         f"  απομείωση λόγω διαμονής  = {npd['residence']:.1f}/40 = {npd['frac_res']*100:.1f}%",
         f"  απομείωση λόγω πρόωρης   = {npd['months_early']:.0f} μήνες ×{npd['early_factor']*100:.1f}%",
         f"  => E = {npd['E']:>7.1f}  €/mo",
+    ]
+    if sp is not None:
+        abroad_A = sp["yrs_A_eff"] - sp["yrs_A"]
+        lines += [
+            sep, "ΕΠΙΚΟΥΡΙΚΗ ΣΥΝΤΑΞΗ  A (υπολογ.)",
+            f"  Τμήμα Α {sp['yrs_A_eff']:.2f}y ×0.45% (μείωση {(1-sp['pen_A'])*100:.0f}%) = {sp['part_A']:>7.1f}",
+        ]
+        if abroad_A > 0.01:
+            lines.append(f"    (= {sp['yrs_A']:.2f}y ΕΛ + {abroad_A:.2f}y εξωτ.)")
+        lines += [
+            f"  Τμήμα Β {sp['yrs_B']:.2f}y NDC (ράντα {sp['rante']:.3f}) = {sp['part_B']:>7.1f}",
+            f"  => A = {sp['A']:>7.1f}  €/mo",
+        ]
+    if m_base is not None:
+        lines += [
+            sep, "ΣΥΝΘΕΣΗ ΑΠΟ ΒΑΣΗ (T0, χωρίς εξωτ/πλασμ)",
+            f"  m βάση = {m_base:>7.1f}   dm (εξωτ+πλασμ) = {r['mp']-m_base:>7.2f}",
+            f"  A βάση = {A_base:>7.1f}   dA (εξωτ+πλασμ) = {r['A_after']-A_base:>7.2f}",
+        ]
+    lines += [
         sep, "ΑΝΤΑΠΟΔΟΤΙΚΗ ΣΥΝΤΑΞΗ",
         f"  m  (πριν)  = {r['m']:>8.1f}  €/mo",
         f"  m' (μετά)  = {r['mp']:>8.1f}  €/mo",
-        sep, "ΔΙΑΦΟΡΑ ΣΥΝΤΑΞΗΣ ΑΠΟ ΕΞΑΓΟΡΑ",
-        f"  μικτή   dm (m'-m) = {r['dm_gross']:>7.2f}  €/mo",
-        f"  ΚΑΘΑΡΗ  dm        = {r['dm_net']:>7.2f}  €/mo",
+        sep, "ΔΙΑΦΟΡΑ ΑΠΟ ΕΞΑΓΟΡΑ N πλασματικών",
+        f"  μικτή dm (ανταποδ.) = {r['dm_gross']:>7.2f}  €/mo",
+    ]
+    if abs(r["dA_gross"]) > 0.01:
+        lines.append(f"  μικτή dA (επικ.)    = {r['dA_gross']:>7.2f}  €/mo")
+    lines += [
+        f"  ΚΑΘΑΡΟ όφελος       = {r['dm_net']:>7.2f}  €/mo",
         sep, "ΚΡΑΤΗΣΕΙΣ ΒΑΣΗΣ (πριν)",
         f"  Υγεία 6% = {b['health']:>7.1f}   ΕΑΣ = {b['eas']:>6.1f}",
         f"  Φόρος    = {b['tax']:>7.1f}",
@@ -99,6 +151,10 @@ def summary_text(v, r, npd, S, B, K):
         f"  καθαρή σύνταξη μετά = {a['net']:>8.1f}  €/mo",
         sep, "ΑΞΙΟΛΟΓΗΣΗ ΕΞΑΓΟΡΑΣ",
         f"  K  κόστος εξαγοράς      = {K:>9.1f} €",
+    ]
+    if k_epik > 0.01:
+        lines.append(f"     (εκ των οποίων επικ. = {k_epik:>7.1f} €)")
+    lines += [
         f"  B  παρούσα αξία οφέλους = {B:>9.1f} €",
         f"  Σ = B - K               = {S:>9.1f} €",
         "  → ΣΥΜΦΕΡΕΙ" if S > 0 else "  → όχι ακόμα θετικό",
@@ -109,23 +165,53 @@ def summary_text(v, r, npd, S, B, K):
 # ----------------------------------------------------------------------------
 #  Charts
 # ----------------------------------------------------------------------------
-def _scn(v, sf, N, E, P):
+def _epik_A(ctx, extra_A):
+    """Compute the επικουρική (dict) for a given extra Τμήμα-Α years amount."""
+    return pc.supplementary_pension(
+        ctx["s_ep"], ctx["yrs_A"], ctx["yrs_B"], ctx["Y"],
+        accrual_A=ctx["accrual_A"], c_rate_B=ctx["c_rate_B"],
+        notional_yield=ctx["notional_yield"], annuity_divisor=ctx["annuity_div"],
+        extra_A=extra_A, apply_penalty_A=ctx["penalty_A"])
+
+
+def _kepik(v, sf, N, ctx):
+    """One-off cost of buying N πλασματικά into the επικουρική (6% basis)."""
+    if ctx and ctx.get("compute") and ctx.get("exagora"):
+        return pc.buyout_cost(sf, N, ctx["epik_rate"], v["upfront"])
+    return 0.0
+
+
+def _scn(v, sf, N, E, P, ctx=None):
+    """Scenario; when the επικ two-part model is active, A moves before→after
+       (abroad always in Τμήμα Α; +N only if επικ-εξαγορά is on)."""
+    if ctx and ctx.get("compute"):
+        A_before = _epik_A(ctx, ctx["extra_abroad"])["A"]
+        extra_after = ctx["extra_abroad"] + (N if ctx.get("exagora") else 0.0)
+        A_after = _epik_A(ctx, extra_after)["A"]
+        return pc.scenario(v["T0"], v["s"], sf, N, E, A_before, pc.CHILDREN, pc.EAS_MAIN,
+                           v["eas_mode"], pc.HEALTH_RATE, v["eas_on_epik"], P,
+                           A_after=A_after)
     return pc.scenario(v["T0"], v["s"], sf, N, E, v["A"], pc.CHILDREN, pc.EAS_MAIN,
                        v["eas_mode"], pc.HEALTH_RATE, v["eas_on_epik"], P)
 
 
-def fig_breakdown(v, r, E):
-    b, a = r["before"], r["after"]
-    base_h, base_e, base_t = b["health"], b["eas"], b["tax"]
-    steps = [("E\nΕθνική", v["E_nat"] if False else E, C_NET), ("A\nΕπικ.", v["A"], C_NET),
-             ("m\nΑνταπ.", r["m"], C_NET), ("dm\n(μικτό)", r["dm_gross"], BLUE),
-             ("Υγεία6%\nβάση", -base_h, C_NEG), ("ΕΑΣ\nβάση", -base_e, C_NEG),
-             ("Φόρος\nβάση", -base_t, C_NEG),
-             ("ΔΥγεία", -(a["health"]-base_h), ORANGE), ("ΔΕΑΣ", -(a["eas"]-base_e), ORANGE),
-             ("ΔΦόρος", -(a["tax"]-base_t), ORANGE)]
-    labels = [s[0] for s in steps] + ["NET\n(μετά)"]
+def fig_breakdown(v, r, E, m_base, A_base):
+    """Decomposition: fixed pure base (E + A_base + m_base, i.e. T0 only, no abroad,
+       no πλασματικά) + dm + dA (the ανταποδ./επικ. uplift from abroad+πλασματικά)
+       − deductions → NET."""
+    a = r["after"]
+    dm = r["mp"] - m_base          # ανταποδοτική uplift from abroad + πλασματικά
+    dA = r["A_after"] - A_base     # επικουρική uplift from abroad + πλασματικά
+    steps = [("E\nΕθνική", E, C_NET), ("A βάση\nΕπικ.", A_base, C_NET),
+             ("m βάση\nΑνταπ.", m_base, C_NET), ("dm\nεξωτ+πλασμ", dm, BLUE)]
+    if abs(dA) > 0.01:
+        steps.append(("dA\nεξωτ+πλασμ", dA, ORANGE))
+    steps += [("ΕΑΣ", -a["eas"], C_NEG), ("Υγεία6%", -a["health"], C_NEG),
+              ("Φόρος", -a["tax"], C_NEG)]
+    labels = [s[0] for s in steps] + ["NET"]
     fig = Figure(figsize=(7.6, 5.2)); ax = fig.add_subplot(111)
-    ymax = E + v["A"] + r["mp"]; ith = 0.055 * ymax; cum = 0.0
+    ymax = max(a["gross"], E + A_base + m_base + max(0.0, dm) + max(0.0, dA))
+    ith = 0.055 * ymax; cum = 0.0
     for i, (lbl, val, c) in enumerate(steps):
         bot = cum if val >= 0 else cum + val
         ax.bar(i, abs(val), bottom=bot, width=0.68, color=c, edgecolor="#555", alpha=.92)
@@ -140,33 +226,36 @@ def fig_breakdown(v, r, E):
     ax.bar(len(steps), a["net"], width=0.68, color=ACCENT, edgecolor="#333")
     ax.text(len(steps), a["net"]/2, f"{a['net']:.0f}", ha="center", va="center",
             color="white", fontsize=10, fontweight="bold")
-    ax.axhline(b["net"], color="#888", lw=1, ls=":", label=f"NET πριν = {b['net']:.0f}")
     ax.axhline(0, color="#333", lw=.8)
     ax.set_xticks(range(len(labels))); ax.set_xticklabels(labels, rotation=20, fontsize=7)
-    ax.set_ylim(0, 3500); ax.set_ylabel("€ / month"); ax.legend(fontsize=8)
-    ax.set_title("Waterfall καθαρής σύνταξης"); ax.grid(axis="y", color=C_GRID, lw=.6)
-    fig.tight_layout(); return fig
+    ax.set_ylim(0, max(3500, ymax * 1.15)); ax.set_ylabel("€ / month")
+    ax.set_title("Σύνθεση σύνταξης: βάση + (εξωτ+πλασμ) − κρατήσεις")
+    ax.grid(axis="y", color=C_GRID, lw=.6); fig.tight_layout(); return fig
 
 
-def fig_dm_vs_N(v, E, P):
+def fig_dm_vs_N(v, E, P, ctx=None):
     Ns = list(range(0, pc.MAX_N + 1))
-    g = [_scn(v, v["sf"], n, E, P)["dm_gross"] for n in Ns]
-    nt = [_scn(v, v["sf"], n, E, P)["dm_net"] for n in Ns]
+    rs = [_scn(v, v["sf"], n, E, P, ctx) for n in Ns]
+    g = [rr["dm_gross"] for rr in rs]
+    nt = [rr["dm_net"] for rr in rs]
     fig = Figure(figsize=(7.6, 5.2)); ax = fig.add_subplot(111)
-    ax.plot(Ns, g, "o-", color=ACCENT, label="μικτό dm")
-    ax.plot(Ns, nt, "s-", color=C_NET, label="ΚΑΘΑΡΟ dm")
+    ax.plot(Ns, g, "o-", color=ACCENT, label="μικτό dm (ανταποδ.)")
+    if ctx and ctx.get("exagora"):
+        ax.plot(Ns, [rr["dA_gross"] for rr in rs], "^-", color=ORANGE, label="μικτό dA (επικ.)")
+    ax.plot(Ns, nt, "s-", color=C_NET, label="ΚΑΘΑΡΟ όφελος")
     ax.axvline(v["N"], color=C_NEG, ls="--", lw=1, label=f"N={v['N']}")
     ax.set_xticks(Ns); ax.set_ylim(0, 500); ax.set_xlabel("N"); ax.set_ylabel("Δ σύνταξη €/mo")
     ax.set_title("Διαφορά σύνταξης vs N"); ax.legend(); ax.grid(color=C_GRID, lw=.6)
     fig.tight_layout(); return fig
 
 
-def fig_sigma_vs_L(v, E, P, disc, grow):
+def fig_sigma_vs_L(v, E, P, disc, grow, ctx=None):
     Ls = list(range(0, 26)); fig = Figure(figsize=(7.6, 5.2)); ax = fig.add_subplot(111)
     for k, col in zip(range(6), SF_COLORS):
-        sf = v["sf"] + k * v["dsf"]; rr = _scn(v, sf, v["N"], E, P)
-        Ss = [pc.sigma(rr["dm_net"], sf, v["N"], L, disc, grow, pc.BUY_RATE, v["upfront"])[0]
-              for L in Ls]
+        sf = v["sf"] + k * v["dsf"]; rr = _scn(v, sf, v["N"], E, P, ctx)
+        kep = _kepik(v, sf, v["N"], ctx)
+        Ss = [pc.sigma(rr["dm_net"], sf, v["N"], L, disc, grow, pc.BUY_RATE, v["upfront"],
+                       extra_cost=kep)[0] for L in Ls]
         be = pc.breakeven_L(Ss, Ls)
         lbl = f"sf={sf:.0f}" + (f"  BE≈{be:.1f}y" if be is not None else "  BE>25y")
         ax.plot(Ls, Ss, "-", color=col, lw=2.4 if k == 0 else 1.3, label=lbl)
@@ -179,12 +268,13 @@ def fig_sigma_vs_L(v, E, P, disc, grow):
     ax.grid(color=C_GRID, lw=.6); fig.tight_layout(); return fig
 
 
-def fig_sigma_vs_N(v, E, P, disc, grow):
+def fig_sigma_vs_N(v, E, P, disc, grow, ctx=None):
     Ns = list(range(1, pc.MAX_N + 1)); fig = Figure(figsize=(7.6, 5.2)); ax = fig.add_subplot(111)
     for k, col in zip(range(6), SF_COLORS):
         sf = v["sf"] + k * v["dsf"]
-        Ss = [pc.sigma(_scn(v, sf, n, E, P)["dm_net"], sf, n, v["L"], disc, grow,
-                       pc.BUY_RATE, v["upfront"])[0] for n in Ns]
+        Ss = [pc.sigma(_scn(v, sf, n, E, P, ctx)["dm_net"], sf, n, v["L"], disc, grow,
+                       pc.BUY_RATE, v["upfront"], extra_cost=_kepik(v, sf, n, ctx))[0]
+              for n in Ns]
         ax.plot(Ns, Ss, "o-", color=col, lw=2.4 if k == 0 else 1.3, label=f"sf={sf:.0f}")
     ax.axhline(0, color="#333", lw=.9); ax.set_xticks(Ns)
     ax.set_xlabel("N"); ax.set_ylabel("Σ = B − K (€)")
@@ -256,27 +346,57 @@ def main():
     npd = pc.national_pension(v["T0"], Y, v["X"], v["EU"], v["NEU"], v["eu_counts"])
     E = npd["E"]
     P = (v["EU"] + v["NEU"]) if v["totalize"] else 0.0
-    r = _scn(v, v["sf"], v["N"], E, P)
+
+    # ---- επικουρική A: computed (two-part, dynamic) or manual ----
+    sp = None
+    epik_ctx = None
+    if v["compute_epik"]:
+        ep = v["ep"]
+        try:
+            es, dd = pc.parse_date(ep["epik_start"]), pc.parse_date(v["D"])
+        except Exception:
+            st.error("Check the επικ. insurance start date format (d/m/y)."); return
+        boundary = date(2015, 1, 1)
+        yrs_A = max(0.0, (min(dd, boundary) - es).days / 365.25)
+        yrs_B = max(0.0, (dd - max(es, boundary)).days / 365.25)
+        epik_ctx = dict(
+            compute=True, exagora=ep["epik_exagora"], epik_rate=ep["epik_rate"],
+            s_ep=ep["s_ep"], accrual_A=ep["accrual_A"], c_rate_B=ep["c_rate_B"],
+            notional_yield=ep["notional_yield"], annuity_div=ep["annuity_div"],
+            penalty_A=ep["penalty_A"], yrs_A=yrs_A, yrs_B=yrs_B, Y=Y,
+            extra_abroad=(P if v["totalize"] else 0.0))   # abroad → Τμήμα Α
+        sp = _epik_A(epik_ctx, epik_ctx["extra_abroad"])  # baseline (before εξαγορά)
+        sp["yrs_A"], sp["yrs_B"] = yrs_A, yrs_B
+        v["A"] = sp["A"]
+
+    r = _scn(v, v["sf"], v["N"], E, P, epik_ctx)
     disc, grow = pc.disc_growth(v["npv_mode"], v["i"])
-    S, B, K = pc.sigma(r["dm_net"], v["sf"], v["N"], v["L"], disc, grow, pc.BUY_RATE, v["upfront"])
+    k_epik = _kepik(v, v["sf"], v["N"], epik_ctx)
+    S, B, K = pc.sigma(r["dm_net"], v["sf"], v["N"], v["L"], disc, grow, pc.BUY_RATE,
+                       v["upfront"], extra_cost=k_epik)
+
+    # pure baseline (T0 only, NO abroad, NO πλασματικά) for the decomposition
+    m_base = pc.replacement_rate(v["T0"]) * v["s"]
+    A_base = _epik_A(epik_ctx, 0.0)["A"] if epik_ctx else v["A"]
 
     tab_calc, tab_sal = st.tabs(["Pension strategy", "Salary ⟨s⟩ tool"])
     with tab_calc:
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Σ = B − K (€)", f"{S:,.0f}", "ΣΥΜΦΕΡΕΙ" if S > 0 else "όχι θετικό",
                   delta_color="off")
-        c2.metric("ΚΑΘΑΡΟ dm (€/mo)", f"{r['dm_net']:,.1f}")
+        c2.metric("ΚΑΘΑΡΟ όφελος εξαγ. (€/mo)", f"{r['dm_net']:,.1f}")
         c3.metric("Εθνική E (€/mo)", f"{E:,.1f}")
         c4.metric("age at D (Y)", f"{Y:.2f}")
         left, right = st.columns([1, 2])
         with left:
-            st.code(summary_text(v, r, npd, S, B, K), language="text")
+            st.code(summary_text(v, r, npd, S, B, K, sp, k_epik, m_base, A_base),
+                    language="text")
         with right:
             t1, t2, t3, t4 = st.tabs(["Breakdown", "dm vs N", "Σ vs L", "Σ vs N (at L)"])
-            t1.pyplot(fig_breakdown(v, r, E))
-            t2.pyplot(fig_dm_vs_N(v, E, P))
-            t3.pyplot(fig_sigma_vs_L(v, E, P, disc, grow))
-            t4.pyplot(fig_sigma_vs_N(v, E, P, disc, grow))
+            t1.pyplot(fig_breakdown(v, r, E, m_base, A_base))
+            t2.pyplot(fig_dm_vs_N(v, E, P, epik_ctx))
+            t3.pyplot(fig_sigma_vs_L(v, E, P, disc, grow, epik_ctx))
+            t4.pyplot(fig_sigma_vs_N(v, E, P, disc, grow, epik_ctx))
     with tab_sal:
         salary_tab()
 
