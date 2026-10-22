@@ -19,6 +19,8 @@ SF_COLORS = ["#1a4f8b", "#2e8b57", "#c77d00", "#8e44ad", "#17a2b8", "#b22222"]
 
 st.set_page_config(page_title="Greek Pension Strategy", layout="wide")
 st.session_state.setdefault("s_box", 3000.0)
+st.session_state.setdefault("s_ep_box", 3000.0)   # επικ. earnings base
+st.session_state.setdefault("yrs_A_box", 0.0)     # 0 = use date-derived split
 
 
 # ----------------------------------------------------------------------------
@@ -48,7 +50,11 @@ def sidebar_inputs():
         auto_rante = sb.checkbox("Auto ράντα from official table (by age)", value=True)
         ep = dict(
             epik_start=sb.text_input("επικ. insurance start (d/m/y)", "1/9/1997"),
-            s_ep=sb.number_input("⟨s_ep⟩ — επικ. earnings base (€/mo)", value=float(s), step=50.0),
+            yrs_A_data=sb.number_input(
+                "yrs_A from EFKA data (0 = use date-derived)",
+                min_value=0.0, step=0.1, format="%.2f", key="yrs_A_box"),
+            s_ep=sb.number_input("⟨s_ep⟩ — επικ. earnings base (€/mo)",
+                                 step=50.0, key="s_ep_box"),
             accrual_A=sb.number_input("Τμήμα Α accrual (%)", value=0.45,
                                       step=0.05, format="%.2f") / 100.0,
             c_rate_B=sb.number_input("Τμήμα Β contribution rate (%)", value=6.0,
@@ -289,7 +295,7 @@ def fig_sigma_vs_N(v, E, P, disc, grow, ctx=None):
 def salary_tab():
     st.subheader("Υπολογισμός μέσου μισθού ⟨s⟩ από e-ΕΦΚΑ")
     c1, c2 = st.columns(2)
-    sal_pdf = c1.file_uploader("EFKA earnings PDF", type="pdf")
+    sal_file = c1.file_uploader("EFKA earnings — PDF or Excel (.xlsx/.xls)", type=["pdf","xlsx","xls"])
     cpi_pdf = c2.file_uploader("CPI (ΔτΚ) PDF — blank = built-in 2026 default", type="pdf")
     insured = st.radio("Insured type", ["ΠΑΛΑΙΟΣ", "ΝΕΟΣ"], horizontal=True)
     start_year = st.number_input("Start year (law: 2002)", value=2002, step=1)
@@ -304,10 +310,14 @@ def salary_tab():
                 cpi, used_default, src = se.load_cpi(None)
             if used_default:
                 st.info("No CPI file — using built-in e-ΕΦΚΑ 2026 default indices.")
-            if sal_pdf is not None:
-                tf = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-                tf.write(sal_pdf.read()); tf.close()
-                rows = se.parse_efka(tf.name); os.unlink(tf.name); srcname = sal_pdf.name
+            if sal_file is not None:
+                ext = sal_file.name.lower().rsplit(".", 1)[-1]
+                tf = tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}")
+                tf.write(sal_file.read()); tf.close()
+                rows = (se.parse_excel_efka(tf.name)
+                        if ext in ("xlsx", "xls")
+                        else se.parse_efka(tf.name))
+                os.unlink(tf.name); srcname = sal_file.name
             else:
                 rows = se.SAMPLE; srcname = "built-in SAMPLE (2007–2009)"
             s_val, months, days, num, aug, skipped = se.compute_average_salary(
@@ -316,21 +326,64 @@ def salary_tab():
             st.success(f"⟨s⟩ = {s_val:,.2f} €/mo   "
                        f"(source {srcname}; {days:,.0f} days → {months:,.2f} months; "
                        f"CPI: {src}; before {int(start_year)} ignored: {skipped})")
+            # --- επικουρική earnings base (ΚΠΚ=101, types 01/03/04/05/09, 2002-2014) ---
+            s_ep, months_ep, yrs_A_actual, _, stats = se.compute_average_salary_epik(
+                rows, cpi, insured)
+            st.session_state["last_s_ep"]  = s_ep
+            st.session_state["last_yrs_A"] = yrs_A_actual
+            if s_ep > 0:
+                # earliest date in data → suggest as epik_start for correct yrs_A
+                epik_dates = [r["from"] for r in rows if r.get("kpk") == se.EPIK_KPK
+                              and 2002 <= r["from"].year <= 2014]
+                all_dates  = [r["from"] for r in rows if r["from"].year >= 1990]
+                earliest   = min(all_dates).strftime("%d/%m/%Y") if all_dates else "?"
+                st.info(
+                    f"**⟨s_ep⟩ (Τμήμα Α base, 2002–2014)** = **{s_ep:,.2f} €/mo**  |  "
+                    f"KPK=101 months 2002–2014: {yrs_A_actual*12:.0f} mos = {yrs_A_actual:.2f} y (informational)  |  "
+                    f"excl. ΚΠΚ≠101: {stats['skip_kpk']}  excl. type: {stats['skip_type']}"
+                )
+                st.caption(
+                    f"ℹ Earliest date in data: **{earliest}**. "
+                    f"Set **'επικ. insurance start'** in the sidebar to your actual career start "
+                    f"to get the correct yrs_A (all insured years up to 2014, not just 2002-2014).")
+            else:
+                st.warning("No ΚΠΚ=101 rows found in 2002–2014 — ⟨s_ep⟩ could not be computed. "
+                           "Check that the PDF covers that period.")
         except SystemExit as e:
             st.error(str(e))
         except Exception as e:
             st.error(f"Error: {e}")
     if "last_s" in st.session_state:
         st.button(f"✓ Use ⟨s⟩ = {st.session_state['last_s']:,.2f} in the calculator",
-                  on_click=_apply_s)          # callback runs BEFORE widgets rebuild
+                  on_click=_apply_s)
         if st.session_state.pop("s_copied", False):
             st.success("⟨s⟩ copied to the Simulation input (see the sidebar).")
+    if st.session_state.get("last_yrs_A", 0) > 0:
+        s_ep_last  = st.session_state["last_s_ep"]
+        yrs_A_last = st.session_state["last_yrs_A"]
+        st.button(
+            f"✓ Apply ⟨s_ep⟩ = {s_ep_last:,.2f} €/mo → Τμήμα Α earnings base",
+            on_click=_apply_epik)
+        if st.session_state.pop("epik_copied", False):
+            st.success("⟨s_ep⟩ applied — set 'επικ. insurance start' in the sidebar "
+                       "to your career start date (for correct yrs_A), "
+                       "then enable 'Compute A'.")
 
 
 def _apply_s():
     """on_click callback: push the computed <s> into the sidebar input key."""
     st.session_state["s_box"] = float(round(st.session_state.get("last_s", 0.0), 2))
     st.session_state["s_copied"] = True
+
+
+def _apply_epik():
+    """on_click callback: push data-derived s_ep into the sidebar key.
+       yrs_A is intentionally NOT pushed here — it must come from the
+       'επικ. insurance start' date field (career start → 31/12/2014),
+       per the official rule: earnings base = 2002-2014 data, but years
+       counted = ALL insured time up to 2014 from career start."""
+    st.session_state["s_ep_box"]  = float(round(st.session_state.get("last_s_ep", 0.0), 2))
+    st.session_state["epik_copied"] = True
 
 
 # ----------------------------------------------------------------------------
@@ -359,6 +412,9 @@ def main():
         boundary = date(2015, 1, 1)
         yrs_A = max(0.0, (min(dd, boundary) - es).days / 365.25)
         yrs_B = max(0.0, (dd - max(es, boundary)).days / 365.25)
+        # override yrs_A with data-derived value when salary tool has set it
+        if ep.get('yrs_A_data', 0.0) > 0.0:
+            yrs_A = ep['yrs_A_data']
         epik_ctx = dict(
             compute=True, exagora=ep["epik_exagora"], epik_rate=ep["epik_rate"],
             s_ep=ep["s_ep"], accrual_A=ep["accrual_A"], c_rate_B=ep["c_rate_B"],
