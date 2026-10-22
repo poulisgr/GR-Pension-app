@@ -3,10 +3,34 @@ EFKA average-salary (<s>) engine.
   <s> = Σ [ pension_relevant · min(gross, cap(year,type)) · CPI(year) ] / (Σ days / 25)
 pension_relevant = 1 if Συνολικές Εισφορές != 0  (excludes BONUS / retroactive).
 cap depends on insured-type: 'ΠΑΛΑΙΟΣ' (pre-1993) vs 'ΝΕΟΣ' (1993+).
+Supports both PDF (parse_efka) and Excel (parse_excel_efka) from e-ΕΦΚΑ.
 """
 from datetime import date
 import os
 import re
+
+# ---------------------------------------------------------------------------
+# Text→code lookup tables for the Excel format (Κλάδος/Πακέτο Κάλυψης and
+# Τύπος Αποδοχών columns use full text descriptions instead of numeric codes).
+# ---------------------------------------------------------------------------
+EXCEL_KPK_MAP = {
+    "ΜΙΚΤΑ, ΙΚΑ-ΤΕΑΜ":         "101",   # κύρια + επικουρική (IKA-TEAM)
+    "ΜΙΚΤΑ":                    "103",   # κύρια/ασθένεια only, no επικ
+    "ΑΠΛΑ ΜΙΚΤΑ ΠΛΗΡΗ":         "1011",  # κύρια/ασθένεια/ανεργία, no επικ
+    "ΕΠΙΔΟΜΑ ΜΗΤΡΟΤΗΤΑΣ ΟΑΕΔ":  "224",   # not relevant
+    "ΕΙΣΦΟΡΕΣ ΓΙΑ ΤΟΝ ΕΛΠΚ":   "899",   # ΕΛΠΚ account, not relevant
+}
+
+EXCEL_TYP_MAP = {
+    "ΤΑΚΤΙΚΕΣ ΑΠΟΔΟΧΕΣ":       "01",
+    "ΔΩΡΟ ΧΡΙΣΤΟΥΓΕΝΝΩΝ":       "03",
+    "ΔΩΡΟ ΠΑΣΧΑ":               "04",
+    "ΕΠΙΔΟΜΑ ΑΔΕΙΑΣ":           "05",
+    "ΑΠΟΔΟΧΕΣ ΑΣΘΕΝΕΙΑΣ":       "08",
+    "ΑΝΑΔΡΟΜΙΚΕΣ ΑΠΟΔΟΧΕΣ":     "09",
+    "ΑΠΟΔΟΧΕΣ ΓΙΑ ΥΠ/ΣΜΟ ΕΛΠΚ":"97",
+    "ΛΟΙΠΕΣ ΑΠΟΔΟΧΕΣ":          "99",   # unclassified; excluded from επικ
+}
 
 
 def _import_pdfplumber():
@@ -47,6 +71,14 @@ def cap_for(year, insured_type="ΠΑΛΑΙΟΣ"):
 # Fraction of the MONTHLY ceiling that applies to each earnings type:
 #   Christmas (03) = 1 month -> full ;  Easter (04) & vacation (05) = half month.
 CAP_FRACTION = {"04": 0.5, "05": 0.5}
+
+# ---------------------------------------------------------------------------
+# Contribution-code rules for the ΕΠΙΚΟΥΡΙΚΗ (Τμήμα Α) earnings base.
+# Source: ΚΠΚ image rules + Ν.4488/2017 art.16 / ΥΑ οικ.23123/785.
+# ---------------------------------------------------------------------------
+EPIK_KPK   = "101"                          # only ΜΙΚΤΑ, ΙΚΑ-ΤΕΑΜ carries επικ contributions
+EPIK_TYPES = {"01", "03", "04", "05", "09"} # 01=τακτικές, 03=ΔΧ, 04=ΔΠ, 05=επίδ.αδείας,
+                                             # 09=αναδρομικές; excludes 08=ασθένεια etc.
 
 
 def eff_cap(year, typ, insured_type="ΠΑΛΑΙΟΣ"):
@@ -120,19 +152,22 @@ def _row_from_cells(cells):
     frm = _date(cells[0]) if cells else None
     if not frm:
         return None
+    kpk = ""
     money_idxs = [i for i, c in enumerate(cells) if "€" in c]
     if len(money_idxs) >= 2:
         mi = money_idxs[0]
         miktes = _money(cells[money_idxs[0]])
         eisf = _money(cells[money_idxs[1]])
         typ = cells[mi - 2] if mi - 2 >= 0 else ""     # Τύπος  = 2 left of Μικτές
+        kpk = cells[mi - 1] if mi - 1 >= 0 else ""     # ΚΠΚ    = 1 left of Μικτές
         days_s = cells[mi - 3] if mi - 3 >= 0 else ""   # Ημέρες = 3 left of Μικτές
     else:                                               # fallback: fixed positions
         get = lambda i: cells[i] if i < len(cells) else ""
         days_s, typ = get(4), get(5)
+        kpk = get(3)                                    # old ΔΡΧ rows: kpk in pos 3
         miktes, eisf = _money(get(7)), _money(get(8))
     days = int(days_s) if days_s.isdigit() else 0
-    return dict(**{"from": frm}, days=days, typ=typ, miktes=miktes, eisfores=eisf)
+    return dict(**{"from": frm}, days=days, typ=typ, kpk=kpk, miktes=miktes, eisfores=eisf)
 
 
 def parse_efka(pdf_path):
@@ -146,6 +181,48 @@ def parse_efka(pdf_path):
                     r = _row_from_cells(cells)
                     if r:
                         rows.append(r)
+    return rows
+
+
+def parse_excel_efka(path):
+    """Parse the e-ΕΦΚΑ earnings Excel into the same row-dict format as parse_efka.
+       Columns used: 'Από', 'Ημέρες', 'Τύπος Αποδοχών', 'Κλάδος/Πακέτο Κάλυψης',
+       'Μικτές αποδοχές'.  The Excel has no 'Συνολικές Εισφορές' column, so
+       eisfores is set to miktes (pension_relevant = 1 whenever miktes > 0)."""
+    try:
+        import pandas as pd
+    except ImportError:
+        raise SystemExit(
+            "\n[!] Missing dependency 'pandas'. Install it with:\n"
+            "       python3 -m pip install pandas openpyxl\n")
+    df = pd.read_excel(path, sheet_name=0,
+                       engine="openpyxl" if str(path).lower().endswith("xlsx") else "xlrd")
+    rows = []
+    for _, r in df.iterrows():
+        # --- date ---
+        raw_from = r.get("Από") if hasattr(r, "get") else r["Από"]
+        if pd.isna(raw_from):
+            continue
+        frm = (raw_from.date() if hasattr(raw_from, "date")
+               else _date(str(raw_from)))
+        if frm is None:
+            continue
+        # --- days ---
+        try:
+            days = int(float(r.get("Ημέρες", 0) or 0))
+        except (ValueError, TypeError):
+            days = 0
+        # --- KPK code (text → numeric string) ---
+        kpk_raw = str(r.get("Κλάδος/Πακέτο Κάλυψης") or "").strip()
+        kpk = EXCEL_KPK_MAP.get(kpk_raw, kpk_raw)
+        # --- earnings type code (text → numeric string) ---
+        typ_raw = str(r.get("Τύπος Αποδοχών") or "").strip()
+        typ = EXCEL_TYP_MAP.get(typ_raw, "")
+        # --- amount ---
+        miktes = _money(str(r.get("Μικτές αποδοχές") or ""))
+        # no eisfores column → use miktes as proxy (pr=1 iff miktes>0)
+        rows.append(dict(**{"from": frm}, days=days, typ=typ, kpk=kpk,
+                         miktes=miktes, eisfores=miktes))
     return rows
 
 
@@ -177,12 +254,52 @@ def compute_average_salary(rows, cpi, insured_type="ΠΑΛΑΙΟΣ", start_year=
     return s_avg, months, total_days, numerator, aug, skipped
 
 
+def compute_average_salary_epik(rows, cpi, insured_type="ΠΑΛΑΙΟΣ",
+                                 epik_start=2002, epik_end=2014):
+    """Compute the επικουρική-specific pensionable earnings average ⟨s_ep⟩.
+       Only rows with ΚΠΚ = '101' (ΜΙΚΤΑ, ΙΚΑ-ΤΕΑΜ) AND earnings type in
+       EPIK_TYPES {01,03,04,05,09} from epik_start..epik_end are included.
+       Returns (s_ep, months_ep, yrs_A_actual, aug_ep, stats) where:
+         yrs_A_actual = months_ep / 12  (actual Τμήμα Α years, from data — may
+                        differ from date-range years if ΚΠΚ=103 gaps exist)
+         stats = dict with row counts for transparency."""
+    total_days = 0.0
+    numerator  = 0.0
+    aug_ep = []
+    stats  = dict(included=0, skip_year=0, skip_kpk=0, skip_type=0)
+    for r in rows:
+        yr = r["from"].year
+        kpk = r.get("kpk", "")
+        typ = r.get("typ", "")
+        if yr < epik_start or yr > epik_end:
+            stats["skip_year"] += 1; continue
+        if kpk != EPIK_KPK:
+            stats["skip_kpk"] += 1; continue
+        if typ not in EPIK_TYPES:
+            stats["skip_type"] += 1; continue
+        cpi_f = cpi.get(yr, 1.0)
+        cap   = eff_cap(yr, typ, insured_type)
+        pr    = 1 if abs(r["eisfores"]) > 1e-9 else 0
+        capped   = min(r["miktes"], cap)
+        contrib  = capped * cpi_f * pr
+        numerator  += contrib
+        total_days += r["days"]
+        stats["included"] += 1
+        aug_ep.append({**r, "cpi": cpi_f, "cap": cap, "pr": pr,
+                       "capped": capped, "contrib": contrib})
+    months_ep     = total_days / 25.0
+    yrs_A_actual  = months_ep / 12.0
+    s_ep = numerator / months_ep if months_ep else 0.0
+    return s_ep, months_ep, yrs_A_actual, aug_ep, stats
+
+
 # ---------------------------------------------------------------------------
 # SAMPLE rows transcribed from image (9).png  (2007-2009)
 # ---------------------------------------------------------------------------
-def _r(f, days, typ, miktes, eisf):
+def _r(f, days, typ, miktes, eisf, kpk="101"):
     d, m, y = map(int, f.split("/"))
-    return dict(**{"from": date(y, m, d)}, days=days, typ=typ, miktes=miktes, eisfores=eisf)
+    return dict(**{"from": date(y, m, d)}, days=days, typ=typ, kpk=kpk,
+                miktes=miktes, eisfores=eisf)
 
 SAMPLE = [
     _r("01/12/2007", 25, "01", 4945.00, 1019.99), _r("01/12/2007", 0, "03", 5151.01, 1019.99),
