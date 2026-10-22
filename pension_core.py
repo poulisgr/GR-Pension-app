@@ -28,7 +28,8 @@ LAMBDA_BANDS = [
     (24, 27, 1.03), (27, 30, 1.21),
     (30, 33, 1.98),   # Καρβέλλης table from 1.10.2019 (was 1.42)
     (33, 36, 2.50),   # (was 1.59)
-    (36, 100, 2.55),  # (was 1.80/2.00)
+    (36, 40, 2.55),   # (was 1.80/2.00) — reaches 50.01% at exactly 40 years
+    (40, 100, 0.50),  # above 40y: only 0.5%/year (minimal incentive past full career)
 ]
 # 2026 income-tax scale (9/20/26/34/44) + tax credit by children
 TAX_BRACKETS = [(10000, 0.09), (10000, 0.20), (10000, 0.26),
