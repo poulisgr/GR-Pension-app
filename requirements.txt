@@ -1,3 +1,5 @@
 streamlit>=1.30
 matplotlib>=3.7
 pdfplumber>=0.10
+pandas>=2.0
+openpyxl>=3.1
