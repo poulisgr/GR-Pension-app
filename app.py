@@ -18,6 +18,20 @@ BLUE, ORANGE = "#17a2b8", "#e67e22"
 SF_COLORS = ["#1a4f8b", "#2e8b57", "#c77d00", "#8e44ad", "#17a2b8", "#b22222"]
 
 st.set_page_config(page_title="Greek Pension Strategy", layout="wide")
+st.markdown("""
+<style>
+/* Blue highlight for the four core mandatory sidebar inputs */
+section[data-testid="stSidebar"] input[aria-label="T0 — years as employee"],
+section[data-testid="stSidebar"] input[aria-label="D — pension start date (d/m/y)"],
+section[data-testid="stSidebar"] input[aria-label="BD — birthday (d/m/y)"],
+section[data-testid="stSidebar"] input[aria-label="⟨s⟩ — avg salary (€/mo)"],
+section[data-testid="stSidebar"] input[aria-label="⟨s_ep⟩ — επικ. earnings base (€/mo)"],
+section[data-testid="stSidebar"] input[aria-label="A — επικουρική (€/mo)"] {
+    background-color: #E3F2FD !important;
+    border: 1.5px solid #90CAF9 !important;
+}
+</style>
+""", unsafe_allow_html=True)
 st.session_state.setdefault("s_box", 3000.0)
 st.session_state.setdefault("s_ep_box", 3000.0)   # επικ. earnings base
 st.session_state.setdefault("yrs_A_box", 0.0)     # 0 = use date-derived split
@@ -34,8 +48,8 @@ def sidebar_inputs():
     D = sb.text_input("D — pension start date (d/m/y)", "1/1/28")
     BD = sb.text_input("BD — birthday (d/m/y)", "05/10/1964")
 
-    sb.subheader("Simulation")
     s = sb.number_input("⟨s⟩ — avg salary (€/mo)", step=50.0, key="s_box")
+    sb.subheader("Προσομείωση εξαγοράς πλασματικών ετών")
     sf = sb.number_input("sf — buy-out salary (€/mo)", value=1000.0, step=50.0)
     N = sb.slider("N — πλασματικά έτη (bought)", 0, pc.MAX_N, 5)
     L = sb.slider("L — life expectancy beyond D (yrs)", 0, 25, 20)
@@ -48,15 +62,16 @@ def sidebar_inputs():
     A = ep = None
     if compute_epik:
         auto_rante = sb.checkbox("Auto ράντα from official table (by age)", value=True)
+        _adv = sb.expander("⚙ Advanced επικ. parameters", expanded=False)
         ep = dict(
             epik_start=sb.text_input("επικ. insurance start (d/m/y)", "1/9/1997"),
-            yrs_A_data=sb.number_input(
-                "yrs_A from EFKA data (0 = use date-derived)",
+            yrs_A_data=_adv.number_input(
+                "yrs_A from EFKA data (0 = date-derived)",
                 min_value=0.0, step=0.1, format="%.2f", key="yrs_A_box"),
             s_ep=sb.number_input("⟨s_ep⟩ — επικ. earnings base (€/mo)",
                                  step=50.0, key="s_ep_box"),
-            accrual_A=sb.number_input("Τμήμα Α accrual (%)", value=0.45,
-                                      step=0.05, format="%.2f") / 100.0,
+            accrual_A=_adv.number_input("Τμήμα Α accrual (%)", value=0.45,
+                                        step=0.05, format="%.2f") / 100.0,
             c_rate_B=sb.number_input("Τμήμα Β contribution rate (%)", value=6.0,
                                      step=0.5, format="%.2f") / 100.0,
             notional_yield=sb.number_input("Τμήμα Β notional yield (%)", value=0.0,
@@ -299,17 +314,21 @@ def salary_tab():
     cpi_pdf = c2.file_uploader("CPI (ΔτΚ) PDF — blank = built-in 2026 default", type="pdf")
     insured = st.radio("Insured type", ["ΠΑΛΑΙΟΣ", "ΝΕΟΣ"], horizontal=True)
     start_year = st.number_input("Start year (law: 2002)", value=2002, step=1)
+    # Pre-load CPI before the button so Compute works in one click
+    import tempfile as _tf2, os as _os2
+    if cpi_pdf is not None:
+        _ct = _tf2.NamedTemporaryFile(delete=False, suffix=".pdf")
+        _ct.write(cpi_pdf.read()); _ct.close()
+        _cpi, _used_default, _cpi_src = se.load_cpi(_ct.name); _os2.unlink(_ct.name)
+    else:
+        _cpi, _used_default, _cpi_src = se.load_cpi(None)
+    if _used_default:
+        st.caption("ℹ CPI: built-in 2026 default (no CPI file uploaded). Upload a CPI PDF to override.")
+
     if st.button("Compute ⟨s⟩", type="primary"):
         import tempfile, os
         try:
-            if cpi_pdf is not None:
-                tf = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-                tf.write(cpi_pdf.read()); tf.close()
-                cpi, used_default, src = se.load_cpi(tf.name); os.unlink(tf.name)
-            else:
-                cpi, used_default, src = se.load_cpi(None)
-            if used_default:
-                st.info("No CPI file — using built-in e-ΕΦΚΑ 2026 default indices.")
+            cpi, used_default, src = _cpi, _used_default, _cpi_src
             if sal_file is not None:
                 ext = sal_file.name.lower().rsplit(".", 1)[-1]
                 tf = tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}")
@@ -420,7 +439,8 @@ def main():
             s_ep=ep["s_ep"], accrual_A=ep["accrual_A"], c_rate_B=ep["c_rate_B"],
             notional_yield=ep["notional_yield"], annuity_div=ep["annuity_div"],
             penalty_A=ep["penalty_A"], yrs_A=yrs_A, yrs_B=yrs_B, Y=Y,
-            extra_abroad=(P if v["totalize"] else 0.0))   # abroad → Τμήμα Α
+            extra_abroad=0.0)          # abroad does NOT boost Greek επικ Τμήμα Α amount
+                                       # (EU totalization helps eligibility, not the Greek amount)
         sp = _epik_A(epik_ctx, epik_ctx["extra_abroad"])  # baseline (before εξαγορά)
         sp["yrs_A"], sp["yrs_B"] = yrs_A, yrs_B
         v["A"] = sp["A"]
